@@ -79,7 +79,7 @@ type ipvsCalls interface {
 }
 
 type netlinkCalls interface {
-	ipAddrAdd(iface netlink.Link, ip string, addRoute bool) error
+	ipAddrAdd(iface netlink.Link, ip string, removeLocalRoutes bool) error
 	ipAddrDel(iface netlink.Link, ip string) error
 	prepareEndpointForDsr(containerId string, endpointIP string, vip string) error
 	getKubeDummyInterface() (netlink.Link, error)
@@ -120,7 +120,7 @@ func (ln *linuxNetworking) ipAddrDel(iface netlink.Link, ip string) error {
 // utility method to assign an IP to an interface. Mainly used to assign service VIP's
 // to kube-dummy-if. Also when DSR is used, used to assign VIP to dummy interface
 // inside the container.
-func (ln *linuxNetworking) ipAddrAdd(iface netlink.Link, ip string, addRoute bool) error {
+func (ln *linuxNetworking) ipAddrAdd(iface netlink.Link, ip string, removeLocalRoutes bool) error {
 	naddr := &netlink.Addr{IPNet: &net.IPNet{IP: net.ParseIP(ip), Mask: net.IPv4Mask(255, 255, 255, 255)}, Scope: syscall.RT_SCOPE_LINK}
 	err := netlink.AddrAdd(iface, naddr)
 	if err != nil && err.Error() != IFACE_HAS_ADDR {
@@ -129,21 +129,27 @@ func (ln *linuxNetworking) ipAddrAdd(iface netlink.Link, ip string, addRoute boo
 		return err
 	}
 
-	// When a service VIP is assigned to a dummy interface and accessed from host, in some of the
-	// case Linux source IP selection logix selects VIP itself as source leading to problems
-	// to avoid this an explicit entry is added to use node IP as source IP when accessing
-	// VIP from the host. Please see https://github.com/cloudnativelabs/kube-router/issues/376
-
-	if !addRoute {
+	if !removeLocalRoutes {
 		return nil
 	}
 
-	// TODO: netlink.RouteReplace which is replacement for below command is not working as expected. Call succeeds but
-	// route is not replaced. For now do it with command.
-	out, err := exec.Command("ip", "route", "replace", "local", ip, "dev", KUBE_DUMMY_IF, "table", "local", "proto", "kernel", "scope", "host", "src",
-		NodeIP.String(), "table", "local").CombinedOutput()
+	// By adding the service IP to the local interface the kernel adds 2 routes in
+	// the local routing table that cause problems for us. So we remove them again
+	// here.
+	// See https://github.com/cloudnativelabs/kube-router/issues/623
+	out, err := exec.Command(
+		"ip", "route", "del", "local", ip, "dev", KUBE_DUMMY_IF,
+		"table", "local", "proto", "kernel", "scope", "host",
+	).CombinedOutput()
 	if err != nil {
-		glog.Errorf("Failed to replace route to service VIP %s configured on %s. Error: %v, Output: %s", ip, KUBE_DUMMY_IF, err, out)
+		glog.Errorf("Failed to remove local route to service VIP %s configured on %s. Error: %v, Output: %s", ip, KUBE_DUMMY_IF, err, out)
+	}
+	out, err = exec.Command(
+		"ip", "route", "del", "broadcast", ip, "dev", KUBE_DUMMY_IF,
+		"table", "local", "proto", "kernel", "scope", "link",
+	).CombinedOutput()
+	if err != nil {
+		glog.Errorf("Failed to remove broadcast route to service VIP %s configured on %s. Error: %v, Output: %s", ip, KUBE_DUMMY_IF, err, out)
 	}
 	return nil
 }
